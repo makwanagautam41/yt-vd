@@ -138,6 +138,9 @@ async function getVideoInfo(url) {
       dumpSingleJson: true,
       skipDownload: true,
       noPlaylist: true,
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      extractorArgs: "youtube:player_client=android,ios,web;player_skip=webpage,configs,js",
+      noCheckCertificates: true,
     });
 
     printHeader("Video Information");
@@ -150,13 +153,12 @@ async function getVideoInfo(url) {
       `  Views:        ${info.view_count?.toLocaleString() || "Unknown"}`
     );
     console.log(
-      `  Upload Date:  ${
-        info.upload_date
-          ? `${info.upload_date.slice(0, 4)}-${info.upload_date.slice(
-              4,
-              6
-            )}-${info.upload_date.slice(6, 8)}`
-          : "Unknown"
+      `  Upload Date:  ${info.upload_date
+        ? `${info.upload_date.slice(0, 4)}-${info.upload_date.slice(
+          4,
+          6
+        )}-${info.upload_date.slice(6, 8)}`
+        : "Unknown"
       }`
     );
     console.log(`  Video ID:     ${info.id || "Unknown"}`);
@@ -199,80 +201,43 @@ async function downloadVideo(url, quality, outputPath) {
   let isMerging = false;
 
   return new Promise(async (resolve, reject) => {
-    // Get yt-dlp executable path from the package
-    let ytdlpPath;
-    try {
-      // Try to import the binary path from yt-dlp-exec
-      const { default: ytdlpBinary } = await import("yt-dlp-exec");
-      ytdlpPath = ytdlpBinary.path;
+    // RESOLVE BINARY PATHS
+    // -------------------
 
-      // If path is not available, try to find it in node_modules
-      if (!ytdlpPath) {
-        const isWindows = process.platform === "win32";
-        const binaryName = isWindows ? "yt-dlp.exe" : "yt-dlp";
-        ytdlpPath = path.join(
-          process.cwd(),
-          "node_modules",
-          "yt-dlp-exec",
-          "bin",
-          binaryName
-        );
+    // 1. Find yt-dlp executable
+    const isWindows = process.platform === "win32";
+    const binaryName = isWindows ? "yt-dlp.exe" : "yt-dlp";
+    const localBinPath = path.join(process.cwd(), "node_modules", "yt-dlp-exec", "bin", binaryName);
+
+    let ytdlpPath = localBinPath;
+    if (!fs.existsSync(ytdlpPath)) {
+      // Fallback or error
+      try {
+        // Try resolving via package if local file missing (backup method)
+        const ytdlpExec = await import("yt-dlp-exec");
+        if (ytdlpExec.default && ytdlpExec.default.path) {
+          ytdlpPath = ytdlpExec.default.path;
+        }
+      } catch (e) {
+        // Ignore
       }
+    }
 
-      printMessage("info", `Using yt-dlp from: ${ytdlpPath}`);
-    } catch (error) {
-      reject(
-        new Error(
-          "Could not find yt-dlp executable. Make sure yt-dlp-exec is installed."
-        )
-      );
+    if (!fs.existsSync(ytdlpPath)) {
+      reject(new Error(`yt-dlp executable not found. Please run 'npm run update-ytdlp'`));
       return;
     }
 
-    // Prepare arguments
-    const args = [
-      url,
-      "--format",
-      format,
-      "--output",
-      outputPath,
-      "--merge-output-format",
-      quality === "audio" ? "mp3" : "mp4",
-      "--newline",
-      "--no-playlist",
-    ];
+    printMessage("info", `Using yt-dlp from: ${ytdlpPath}`);
 
-    // Add metadata for audio
-    if (quality === "audio") {
-      args.push("--embed-thumbnail", "--embed-metadata", "--add-metadata");
-    }
-
-    // Try to find ffmpeg
+    // 2. Find ffmpeg executable
     const ffmpegLocations = [
-      path.join(process.cwd(), "node_modules", "ffmpeg-static", "ffmpeg.exe"),
-      path.join(process.cwd(), "node_modules", "ffmpeg-static", "ffmpeg"),
-      path.join(
-        process.cwd(),
-        "node_modules",
-        "@ffmpeg-installer",
-        "win32-x64",
-        "ffmpeg.exe"
-      ),
-      path.join(
-        process.cwd(),
-        "node_modules",
-        "@ffmpeg-installer",
-        "darwin-x64",
-        "ffmpeg"
-      ),
-      path.join(
-        process.cwd(),
-        "node_modules",
-        "@ffmpeg-installer",
-        "linux-x64",
-        "ffmpeg"
-      ),
+      path.join(process.cwd(), "node_modules", "ffmpeg-static", isWindows ? "ffmpeg.exe" : "ffmpeg"),
+      path.join(process.cwd(), "node_modules", "ffmpeg-static", "bin", isWindows ? "ffmpeg.exe" : "ffmpeg"), // some versions have bin
+      path.join(process.cwd(), "ffmpeg", isWindows ? "ffmpeg.exe" : "ffmpeg"),
     ];
+
+    // Add env path or other common locations if needed
 
     let ffmpegPath = null;
     for (const location of ffmpegLocations) {
@@ -282,34 +247,54 @@ async function downloadVideo(url, quality, outputPath) {
       }
     }
 
+    // CONSTRUCT ARGUMENTS
+    // -------------------
+
+    const args = [
+      url,
+      "--format", format,
+      "--output", outputPath,
+      "--newline",
+      "--no-playlist",
+      "--no-check-certificates",
+
+      // Anti-bot Bypass Options
+      "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      "--extractor-args", "youtube:player_client=android,ios,web;player_skip=webpage,configs,js",
+
+      // Network/Retry Options
+      "--retries", "10",
+      "--fragment-retries", "10",
+      "--retry-sleep", "3",
+      "--concurrent-fragments", "5",
+      "--throttled-rate", "100K",
+    ];
+
+    // Merge Format Logic
     if (ffmpegPath) {
       args.push("--ffmpeg-location", ffmpegPath);
+      args.push("--merge-output-format", quality === "audio" ? "mp3" : "mp4");
       printMessage("info", `Using ffmpeg from: ${ffmpegPath}`);
     } else {
-      printMessage(
-        "warning",
-        "ffmpeg not found - will download best single format without merging"
-      );
-      // Remove merge format and use single format
-      const mergeIndex = args.indexOf("--merge-output-format");
-      if (mergeIndex !== -1) {
-        args.splice(mergeIndex, 2);
+      printMessage("warning", "ffmpeg not found - will download best single format without merging");
+      // Simplify format if no ffmpeg
+      if (quality !== "audio") {
+        // Replace the format arg we added earlier
+        const fmtIndex = args.indexOf("--format");
+        if (fmtIndex !== -1) {
+          args[fmtIndex + 1] = `best[height<=${quality}]/best`;
+        }
       }
-      // Change format to single file format
-      const formatIndex = args.indexOf("--format");
-      if (formatIndex !== -1 && quality !== "audio") {
-        args[formatIndex + 1] = `best[height<=${quality}]/best`;
-      }
+    }
+
+    // Metadata
+    if (quality === "audio") {
+      args.push("--embed-thumbnail", "--embed-metadata", "--add-metadata");
     }
 
     printMessage("info", "Starting download...");
     console.log();
 
-    // Check if the executable exists
-    if (!fs.existsSync(ytdlpPath)) {
-      reject(new Error(`yt-dlp executable not found at: ${ytdlpPath}`));
-      return;
-    }
 
     // Spawn the process
     const childProcess = spawn(ytdlpPath, args);
@@ -499,7 +484,7 @@ async function downloadVideo(url, quality, outputPath) {
 
         resolve();
       } else {
-        reject(new Error(`yt-dlp process exited with code ${code}`));
+        reject(new Error(`yt-dlp prasocess exited with code ${code}`));
       }
     });
 
