@@ -120,14 +120,151 @@ function promptUser(question) {
   });
 }
 
-function displayQualityOptions() {
-  printHeader("Available Quality Options");
-  let index = 1;
-  for (const [key, value] of Object.entries(CONFIG.qualities)) {
-    console.log(`  ${index}. ${value.label} (${key})`);
-    index++;
+function isUsableVideoFormat(format) {
+  return format.height && format.vcodec && format.vcodec !== "none";
+}
+
+function hasAudio(format) {
+  return format.acodec && format.acodec !== "none";
+}
+
+function getApproxFormatSize(format) {
+  return format.filesize || format.filesize_approx || 0;
+}
+
+function getFormatScore(format) {
+  return (
+    (format.quality || 0) * 1000000 +
+    (format.tbr || format.vbr || 0) * 1000 +
+    (format.fps || 0) * 10 +
+    getApproxFormatSize(format)
+  );
+}
+
+function pickBestFormat(formats) {
+  return [...formats].sort((a, b) => getFormatScore(b) - getFormatScore(a))[0];
+}
+
+function pickBestAudioFormat(formats) {
+  return [...formats]
+    .filter((format) => hasAudio(format) && (!format.vcodec || format.vcodec === "none"))
+    .sort((a, b) => {
+      const aScore = (a.abr || a.tbr || 0) * 1000 + getApproxFormatSize(a);
+      const bScore = (b.abr || b.tbr || 0) * 1000 + getApproxFormatSize(b);
+      return bScore - aScore;
+    })[0];
+}
+
+function getQualityLabel(height) {
+  const configuredLabel = CONFIG.qualities[height]?.label;
+  return configuredLabel || `${height}p`;
+}
+
+function createExactHeightFormat(height, videoFormat, audioFormat) {
+  const formatSelectors = [];
+
+  if (videoFormat?.format_id && audioFormat?.format_id && !hasAudio(videoFormat)) {
+    formatSelectors.push(`${videoFormat.format_id}+${audioFormat.format_id}`);
   }
+
+  if (videoFormat?.format_id) {
+    formatSelectors.push(videoFormat.format_id);
+  }
+
+  formatSelectors.push(
+    `bestvideo[height=${height}]+bestaudio/best[height=${height}]`
+  );
+
+  return formatSelectors.join("/");
+}
+
+function buildAvailableQualityOptions(info) {
+  const videoFormats = (info.formats || []).filter(isUsableVideoFormat);
+  const formatsByHeight = new Map();
+
+  for (const format of videoFormats) {
+    const height = Number(format.height);
+    if (!formatsByHeight.has(height)) {
+      formatsByHeight.set(height, []);
+    }
+    formatsByHeight.get(height).push(format);
+  }
+
+  const videoOptions = [...formatsByHeight.entries()]
+    .sort(([heightA], [heightB]) => heightB - heightA)
+    .map(([height, formats]) => {
+      const bestVideoFormat = pickBestFormat(formats);
+      const bestAudioFormat = pickBestAudioFormat(info.formats || []);
+      const maxFps = Math.max(...formats.map((format) => format.fps || 0));
+      const bestSize = Math.max(...formats.map(getApproxFormatSize));
+      const exts = [...new Set(formats.map((format) => format.ext).filter(Boolean))];
+      const progressiveCount = formats.filter(hasAudio).length;
+      const details = [
+        maxFps ? `${maxFps}fps` : null,
+        bestVideoFormat?.format_id ? `format ${bestVideoFormat.format_id}` : null,
+        exts.length ? exts.join("/") : null,
+        bestSize ? `~${formatBytes(bestSize)}` : null,
+        progressiveCount ? "single file available" : "video+audio merge",
+      ].filter(Boolean);
+
+      return {
+        key: String(height),
+        type: "video",
+        height,
+        label: getQualityLabel(height),
+        format: createExactHeightFormat(height, bestVideoFormat, bestAudioFormat),
+        details,
+      };
+    });
+
+  return [
+    ...videoOptions,
+    {
+      key: "audio",
+      type: "audio",
+      label: CONFIG.qualities.audio.label,
+      format: CONFIG.qualities.audio.format,
+      details: ["best audio stream"],
+    },
+    {
+      key: "best",
+      type: "best",
+      label: CONFIG.qualities.best.label,
+      format: CONFIG.qualities.best.format,
+      details: ["highest quality yt-dlp can combine"],
+    },
+  ];
+}
+
+function displayQualityOptions(qualityOptions) {
+  printHeader("Available Quality Options");
+  qualityOptions.forEach((option, index) => {
+    const details = option.details?.length ? ` - ${option.details.join(", ")}` : "";
+    console.log(`  ${index + 1}. ${option.label} (${option.key})${details}`);
+  });
   console.log();
+}
+
+function resolveQualitySelection(input, qualityOptions) {
+  const selection = input.trim().toLowerCase();
+  if (!selection) {
+    return qualityOptions.find((option) => option.key === CONFIG.defaultQuality);
+  }
+
+  const selectedIndex = Number.parseInt(selection, 10) - 1;
+  if (
+    Number.isInteger(selectedIndex) &&
+    selectedIndex >= 0 &&
+    selectedIndex < qualityOptions.length
+  ) {
+    return qualityOptions[selectedIndex];
+  }
+
+  const normalizedSelection = selection.endsWith("p")
+    ? selection.slice(0, -1)
+    : selection;
+
+  return qualityOptions.find((option) => option.key === normalizedSelection);
 }
 
 async function getVideoInfo(url) {
@@ -138,8 +275,8 @@ async function getVideoInfo(url) {
       dumpSingleJson: true,
       skipDownload: true,
       noPlaylist: true,
+      jsRuntimes: "node",
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      extractorArgs: "youtube:player_client=android,ios,web;player_skip=webpage,configs,js",
       noCheckCertificates: true,
     });
 
@@ -182,15 +319,14 @@ async function getVideoInfo(url) {
   }
 }
 
-async function downloadVideo(url, quality, outputPath) {
-  const format =
-    CONFIG.qualities[quality]?.format || CONFIG.qualities.best.format;
+async function downloadVideo(url, qualityOption, outputPath) {
+  const quality = qualityOption?.key || CONFIG.defaultQuality;
+  const format = qualityOption?.format || CONFIG.qualities.best.format;
+  const qualityLabel =
+    qualityOption?.label || CONFIG.qualities[quality]?.label || "Best Available";
 
   printHeader("Download Progress");
-  printMessage(
-    "download",
-    `Quality: ${CONFIG.qualities[quality]?.label || "Best Available"}`
-  );
+  printMessage("download", `Quality: ${qualityLabel}`);
   printMessage("download", `Format: ${format}`);
   printMessage("info", `Output: ${outputPath}`);
   console.log();
@@ -257,10 +393,10 @@ async function downloadVideo(url, quality, outputPath) {
       "--newline",
       "--no-playlist",
       "--no-check-certificates",
+      "--js-runtimes", "node",
 
       // Anti-bot Bypass Options
       "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      "--extractor-args", "youtube:player_client=android,ios,web;player_skip=webpage,configs,js",
 
       // Network/Retry Options
       "--retries", "10",
@@ -273,16 +409,18 @@ async function downloadVideo(url, quality, outputPath) {
     // Merge Format Logic
     if (ffmpegPath) {
       args.push("--ffmpeg-location", ffmpegPath);
-      args.push("--merge-output-format", quality === "audio" ? "mp3" : "mp4");
+      if (quality !== "audio") {
+        args.push("--merge-output-format", "mkv");
+      }
       printMessage("info", `Using ffmpeg from: ${ffmpegPath}`);
     } else {
       printMessage("warning", "ffmpeg not found - will download best single format without merging");
       // Simplify format if no ffmpeg
-      if (quality !== "audio") {
+      if (qualityOption?.type === "video") {
         // Replace the format arg we added earlier
         const fmtIndex = args.indexOf("--format");
         if (fmtIndex !== -1) {
-          args[fmtIndex + 1] = `best[height<=${quality}]/best`;
+          args[fmtIndex + 1] = `best[height=${quality}]`;
         }
       }
     }
@@ -397,27 +535,15 @@ async function downloadVideo(url, quality, outputPath) {
     childProcess.on("close", (code) => {
       console.log();
 
-      if (code === 0 || code === 1) {
-        // Code 1 might be ffmpeg warning but file still downloaded
+      if (code === 0) {
         const downloadTime = ((Date.now() - downloadStartTime) / 1000).toFixed(
           2
         );
 
-        if (code === 1 && isMerging) {
-          printMessage(
-            "warning",
-            `Download completed with warnings in ${downloadTime} seconds`
-          );
-          printMessage(
-            "info",
-            "Video and audio may be in separate files or lower quality"
-          );
-        } else {
-          printMessage(
-            "success",
-            `All operations completed in ${downloadTime} seconds!`
-          );
-        }
+        printMessage(
+          "success",
+          `All operations completed in ${downloadTime} seconds!`
+        );
 
         // Verify file exists
         const baseFileName = path.basename(
@@ -469,22 +595,9 @@ async function downloadVideo(url, quality, outputPath) {
           }
         }
 
-        if (code === 1) {
-          console.log();
-          printMessage(
-            "info",
-            "To enable video+audio merging, install ffmpeg:"
-          );
-          printMessage("info", "npm install ffmpeg-static");
-          printMessage(
-            "info",
-            "or download from: https://ffmpeg.org/download.html"
-          );
-        }
-
         resolve();
       } else {
-        reject(new Error(`yt-dlp prasocess exited with code ${code}`));
+        reject(new Error(`yt-dlp process exited with code ${code}`));
       }
     });
 
@@ -515,26 +628,21 @@ async function main() {
 
     const videoInfo = await getVideoInfo(videoUrl);
 
-    displayQualityOptions();
+    const qualityOptions = buildAvailableQualityOptions(videoInfo);
+    displayQualityOptions(qualityOptions);
 
     const qualityInput = await promptUser(
-      "Enter quality (360/480/720/1080/1440/2160/audio/best) or number [default: best]: "
+      "Enter an available quality, audio, best, or number [default: best]: "
     );
 
-    let quality = qualityInput.toLowerCase() || "best";
+    let selectedQuality = resolveQualitySelection(qualityInput, qualityOptions);
 
-    const qualityKeys = Object.keys(CONFIG.qualities);
-    const qualityIndex = parseInt(qualityInput) - 1;
-    if (qualityIndex >= 0 && qualityIndex < qualityKeys.length) {
-      quality = qualityKeys[qualityIndex];
-    }
-
-    if (!CONFIG.qualities[quality]) {
+    if (!selectedQuality) {
       printMessage(
         "warning",
-        `Invalid quality "${quality}", using "best" instead`
+        `Invalid or unavailable quality "${qualityInput}", using "best" instead`
       );
-      quality = "best";
+      selectedQuality = qualityOptions.find((option) => option.key === "best");
     }
 
     const sanitizedTitle = videoInfo.title
@@ -543,13 +651,13 @@ async function main() {
       .trim()
       .substring(0, 200);
 
-    const ext = quality === "audio" ? "mp3" : "mp4";
+    const ext = selectedQuality.key === "audio" ? "mp3" : "mp4";
     const outputPath = path.join(
       CONFIG.downloadsDir,
       `${sanitizedTitle}.%(ext)s`
     );
 
-    await downloadVideo(videoUrl, quality, outputPath);
+    await downloadVideo(videoUrl, selectedQuality, outputPath);
 
     printHeader("Download Summary");
     printMessage("success", "All operations completed successfully!");
